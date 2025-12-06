@@ -51,6 +51,7 @@ class SconnControllerV9(app_manager.RyuApp):
 
     @set_ev_cls([event.EventSwitchEnter, event.EventLinkAdd, event.EventLinkDelete])
     def topology_change_handler(self, ev):
+        # Fixed section to handle link deletions properly
         if isinstance(ev, event.EventSwitchEnter):
             switch = ev.switch
             self.switch_net.add_node(switch.dp.id)
@@ -59,22 +60,20 @@ class SconnControllerV9(app_manager.RyuApp):
             # Manually add the wireless mesh link once both APs are present
             if not self.manual_link_added and 2 in self.switch_net and 3 in self.switch_net:
                 self.switch_net.add_edge(2, 3, port=6)
-                self.switch_net.add_edge(3, 2, port=6)
                 self.manual_link_added = True
                 self.logger.info("Manually added wireless link between 2 and 3.")
 
         elif isinstance(ev, event.EventLinkAdd):
             link = ev.link
             self.switch_net.add_edge(link.src.dpid, link.dst.dpid, port=link.src.port_no)
-            self.switch_net.add_edge(link.dst.dpid, link.src.dpid, port=link.dst.port_no)
             self.logger.info("Link added: %s <--> %s", link.src.dpid, link.dst.dpid)
 
         elif isinstance(ev, event.EventLinkDelete):
             link = ev.link
             # Check if the edge exists before removing to avoid errors
+            # Spanning Tree Protocol (STP) related link deletion handling
             if self.switch_net.has_edge(link.src.dpid, link.dst.dpid):
                 self.switch_net.remove_edge(link.src.dpid, link.dst.dpid)
-                self.switch_net.remove_edge(link.dst.dpid, link.src.dpid)
                 self.logger.warning("Link deleted: %s <--> %s", link.src.dpid, link.dst.dpid)
                 
                 # Clear flows and MAC table ONLY when a link is confirmed to be deleted
@@ -121,6 +120,10 @@ class SconnControllerV9(app_manager.RyuApp):
         else:
             self.logger.info("Destination %s unknown on switch %s. Flooding via Spanning Tree.", dst, dpid)
             
+            # Key error fixed: Ensure datapath is registered before accessing ports
+            if dpid not in self.datapaths:
+                self.logger.warning("Datapath %s not registered yet. Dropping packet.", dpid)
+                return
             all_ports = self.datapaths[dpid].ports.keys()
             inter_switch_ports = []
             if dpid in self.switch_net:
@@ -134,7 +137,8 @@ class SconnControllerV9(app_manager.RyuApp):
                 if p not in inter_switch_ports:
                     flood_ports.append(p)
                 else:
-                    if dpid in self.stp_net and self.stp_net.has_edge(dpid, self._get_neighbor_by_port(dpid, p)):
+                    neighbor = self._get_neighbor_by_port(dpid, p)
+                    if neighbor and dpid in self.stp_net and neighbor in self.stp_net and self.stp_net.has_edge(dpid, neighbor):
                         flood_ports.append(p)
             
             self.logger.info("Flooding on switch %s to ports: %s", dpid, flood_ports)
