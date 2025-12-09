@@ -15,4 +15,3 @@ GSYMS
 covhtml/
 coverage.xml
 nosetests.xml
-ryu/app/sconn_old.py
