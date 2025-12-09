@@ -139,34 +139,28 @@ class SconnControllerV9(app_manager.RyuApp):
                 self.logger.warning("Datapath %s not registered yet. Dropping packet.", dpid)
                 return
             all_ports = self.datapaths[dpid].ports.keys()
-            stp_ports = set()
-            blocked_ports = set()
             
-            # Identify STP ports and blocked ports
+            # Identify inter-switch ports (both STP and non-STP)
+            inter_switch_ports = []
             if dpid in self.switch_net:
                 for neighbor in self.switch_net.neighbors(dpid):
                     edge_data = self.switch_net[dpid][neighbor]
                     port = edge_data.get('ports', {}).get(dpid, edge_data.get('port'))
                     if port:
-                        if self.stp_net.has_edge(dpid, neighbor):
-                            stp_ports.add(port)
-                        else:
-                            blocked_ports.add(port)
-                            # Install blocking rule for non-STP inter-switch ports
-                            match = parser.OFPMatch(in_port=port)
-                            self.add_flow(datapath, 10, match, [], idle=0, hard=0)
-                            self.logger.info("Blocking non-STP port %s on switch %s", port, dpid)
+                        inter_switch_ports.append(port)
 
             flood_ports = []
             for p in all_ports:
-                # Skip invalid ports: in_port, blocked ports, and special OpenFlow ports
-                if p == in_port or p >= ofproto.OFPP_MAX or p in blocked_ports:
+                # Skip invalid ports: in_port and special OpenFlow ports
+                if p == in_port or p >= ofproto.OFPP_MAX:
                     continue
-                # Add host ports (non inter-switch) and STP ports
-                if p not in stp_ports and p not in blocked_ports:
-                    flood_ports.append(p)  # Host port
-                elif p in stp_ports:
-                    flood_ports.append(p)  # STP inter-switch port
+                # For non-inter-switch ports (host ports), always include
+                if p not in inter_switch_ports:
+                    flood_ports.append(p)
+                else:
+                    # For inter-switch ports, only include if in STP
+                    if dpid in self.stp_net and self.stp_net.has_edge(dpid, self._get_neighbor_by_port(dpid, p)):
+                        flood_ports.append(p)
             
             self.logger.info("Flooding on switch %s to ports: %s", dpid, flood_ports)
             actions = [parser.OFPActionOutput(p) for p in flood_ports]
