@@ -21,6 +21,8 @@ class SconnControllerV9(app_manager.RyuApp):
         self.mac_to_port = {}
         self.datapaths = {}
         self.manual_link_added = False
+        # Store port mapping: (dpid1, dpid2) -> {dpid1: port1, dpid2: port2}
+        self.link_ports = {}
         self.logger.setLevel(logging.INFO)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -44,6 +46,17 @@ class SconnControllerV9(app_manager.RyuApp):
                                 instructions=inst)
         datapath.send_msg(mod)
 
+    def _get_link_key(self, dpid1, dpid2):
+        """Generate a consistent key for link_ports dict (smaller dpid first)"""
+        return (min(dpid1, dpid2), max(dpid1, dpid2))
+
+    def _get_port_to_neighbor(self, dpid, neighbor):
+        """Get the port on dpid that connects to neighbor"""
+        key = self._get_link_key(dpid, neighbor)
+        if key in self.link_ports:
+            return self.link_ports[key].get(dpid)
+        return None
+
     def _calculate_stp(self):
         if self.switch_net.nodes:
             self.stp_net = nx.minimum_spanning_tree(self.switch_net)
@@ -51,7 +64,6 @@ class SconnControllerV9(app_manager.RyuApp):
 
     @set_ev_cls([event.EventSwitchEnter, event.EventLinkAdd, event.EventLinkDelete])
     def topology_change_handler(self, ev):
-        # Fixed section to handle link deletions properly
         if isinstance(ev, event.EventSwitchEnter):
             switch = ev.switch
             self.switch_net.add_node(switch.dp.id)
@@ -59,29 +71,51 @@ class SconnControllerV9(app_manager.RyuApp):
             
             # Manually add the wireless mesh link once both APs are present
             if not self.manual_link_added and 2 in self.switch_net and 3 in self.switch_net:
-                self.switch_net.add_edge(2, 3, ports={2: 6, 3: 6})
+                self.switch_net.add_edge(2, 3)
+                key = self._get_link_key(2, 3)
+                self.link_ports[key] = {2: 6, 3: 6}
                 self.manual_link_added = True
-                self.logger.info("Manually added wireless link between 2 and 3.")
+                self.logger.info("Manually added wireless link between 2(port 6) and 3(port 6).")
 
         elif isinstance(ev, event.EventLinkAdd):
             link = ev.link
-            # Store port information for both directions
-            if not self.switch_net.has_edge(link.src.dpid, link.dst.dpid):
-                self.switch_net.add_edge(link.src.dpid, link.dst.dpid, 
-                                        ports={link.src.dpid: link.src.port_no, 
-                                               link.dst.dpid: link.dst.port_no})
+            src_dpid, dst_dpid = link.src.dpid, link.dst.dpid
+            src_port, dst_port = link.src.port_no, link.dst.port_no
+            
+            # Add edge to graph (only once for undirected graph)
+            if not self.switch_net.has_edge(src_dpid, dst_dpid):
+                self.switch_net.add_edge(src_dpid, dst_dpid)
+            
+            # Store port information separately with consistent key
+            key = self._get_link_key(src_dpid, dst_dpid)
+            self.link_ports[key] = {src_dpid: src_port, dst_dpid: dst_port}
+            
             self.logger.info("Link added: %s(port %s) <--> %s(port %s)", 
-                           link.src.dpid, link.src.port_no, link.dst.dpid, link.dst.port_no)
+                           src_dpid, src_port, dst_dpid, dst_port)
 
         elif isinstance(ev, event.EventLinkDelete):
             link = ev.link
-            # Check if the edge exists before removing to avoid errors
-            # Spanning Tree Protocol (STP) related link deletion handling
-            if self.switch_net.has_edge(link.src.dpid, link.dst.dpid):
-                self.switch_net.remove_edge(link.src.dpid, link.dst.dpid)
-                self.logger.warning("Link deleted: %s <--> %s", link.src.dpid, link.dst.dpid)
+            src_dpid, dst_dpid = link.src.dpid, link.dst.dpid
+            
+            # IMPORTANT: Protect the manually added wireless link (2-3) from being deleted
+            is_wireless_link = (src_dpid == 2 and dst_dpid == 3) or \
+                               (src_dpid == 3 and dst_dpid == 2)
+            
+            if is_wireless_link:
+                self.logger.info("Ignoring delete event for wireless link 2 <--> 3 (manually managed)")
+                return
+            
+            # Check if the edge exists before removing
+            if self.switch_net.has_edge(src_dpid, dst_dpid):
+                self.switch_net.remove_edge(src_dpid, dst_dpid)
+                # Also remove port information
+                key = self._get_link_key(src_dpid, dst_dpid)
+                if key in self.link_ports:
+                    del self.link_ports[key]
+                    
+                self.logger.warning("Link deleted: %s <--> %s", src_dpid, dst_dpid)
                 
-                # Clear flows and MAC table ONLY when a link is confirmed to be deleted
+                # Clear flows and MAC table to force path re-learning
                 self.logger.warning("Clearing all flows and MAC table to force path re-learning.")
                 for dp in self.datapaths.values():
                     ofproto = dp.ofproto
@@ -94,7 +128,6 @@ class SconnControllerV9(app_manager.RyuApp):
 
         self._calculate_stp()
         self.logger.info("Current Full Links: %s", sorted(self.switch_net.edges()))
-        # =======================================================
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -113,15 +146,6 @@ class SconnControllerV9(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        
-        # Drop IPv6 multicast and other multicast packets to reduce flooding noise
-        if dst.startswith('33:33') or dst.startswith('01:00:5e'):
-            # Install a low-priority flow to drop these multicast packets
-            match = parser.OFPMatch(eth_dst=dst)
-            actions = []  # Empty actions = drop
-            self.add_flow(datapath, 1, match, actions, idle=300, hard=600)
-            self.logger.debug("Dropping multicast packet: %s on switch %s", dst, dpid)
-            return
         self.mac_to_port.setdefault(dpid, {})
 
         if self.mac_to_port[dpid].get(src) != in_port:
@@ -134,40 +158,32 @@ class SconnControllerV9(app_manager.RyuApp):
         else:
             self.logger.info("Destination %s unknown on switch %s. Flooding via Spanning Tree.", dst, dpid)
             
-            # Key error fixed: Ensure datapath is registered before accessing ports
-            if dpid not in self.datapaths:
-                self.logger.warning("Datapath %s not registered yet. Dropping packet.", dpid)
-                return
             all_ports = self.datapaths[dpid].ports.keys()
-            
-            # Identify inter-switch ports (both STP and non-STP)
             inter_switch_ports = []
             if dpid in self.switch_net:
                 for neighbor in self.switch_net.neighbors(dpid):
-                    edge_data = self.switch_net[dpid][neighbor]
-                    port = edge_data.get('ports', {}).get(dpid, edge_data.get('port'))
+                    port = self._get_port_to_neighbor(dpid, neighbor)
                     if port:
                         inter_switch_ports.append(port)
 
             flood_ports = []
             for p in all_ports:
-                # Skip invalid ports: in_port and special OpenFlow ports
-                if p == in_port or p >= ofproto.OFPP_MAX:
+                if p == in_port:
                     continue
-                # For non-inter-switch ports (host ports), always include
                 if p not in inter_switch_ports:
+                    # Host port - always flood
                     flood_ports.append(p)
                 else:
-                    # For inter-switch ports, only include if in STP
-                    if dpid in self.stp_net and self.stp_net.has_edge(dpid, self._get_neighbor_by_port(dpid, p)):
+                    # Inter-switch port - only flood if in STP
+                    neighbor = self._get_neighbor_by_port(dpid, p)
+                    if neighbor and dpid in self.stp_net and self.stp_net.has_edge(dpid, neighbor):
                         flood_ports.append(p)
             
             self.logger.info("Flooding on switch %s to ports: %s", dpid, flood_ports)
             actions = [parser.OFPActionOutput(p) for p in flood_ports]
 
-        # Install flow rule for known unicast destinations
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
+        if len(actions) == 1 and actions[0].port != ofproto.OFPP_FLOOD:
+            out_port = actions[0].port
             self.logger.info("Installing flow on switch %s: in_port=%s, dst=%s -> out_port=%s",
                              dpid, in_port, dst, out_port)
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
@@ -181,10 +197,9 @@ class SconnControllerV9(app_manager.RyuApp):
         datapath.send_msg(out)
 
     def _get_neighbor_by_port(self, dpid, port):
+        """Find the neighbor dpid connected via the given port"""
         for neighbor in self.switch_net.neighbors(dpid):
-            edge_data = self.switch_net[dpid][neighbor]
-            stored_port = edge_data.get('ports', {}).get(dpid, edge_data.get('port'))
-            if stored_port == port:
+            if self._get_port_to_neighbor(dpid, neighbor) == port:
                 return neighbor
         return None
 
