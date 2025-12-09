@@ -46,7 +46,10 @@ class SconnControllerV9(app_manager.RyuApp):
 
     def _calculate_stp(self):
         if self.switch_net.nodes:
-            self.stp_net = nx.minimum_spanning_tree(self.switch_net)
+            # Convert DiGraph to undirected Graph for spanning tree calculation
+            # (minimum_spanning_tree only works with undirected graphs)
+            undirected = self.switch_net.to_undirected()
+            self.stp_net = nx.minimum_spanning_tree(undirected)
             self.logger.info("Spanning Tree Links (used for flooding): %s", sorted(self.stp_net.edges()))
 
     @set_ev_cls([event.EventSwitchEnter, event.EventLinkAdd, event.EventLinkDelete])
