@@ -16,7 +16,7 @@ class SconnControllerV9(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SconnControllerV9, self).__init__(*args, **kwargs)
         self.topology_api_app = self
-        self.switch_net = nx.Graph()
+        self.switch_net = nx.DiGraph()  # Use directed graph for bidirectional port mapping
         self.stp_net = nx.Graph()
         self.mac_to_port = {}
         self.datapaths = {}
@@ -91,10 +91,16 @@ class SconnControllerV9(app_manager.RyuApp):
                 for dp in self.datapaths.values():
                     ofproto = dp.ofproto
                     parser = dp.ofproto_parser
+                    # Delete all flow tables
                     mod = parser.OFPFlowMod(dp, command=ofproto.OFPFC_DELETE,
                                             out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
                                             match=parser.OFPMatch())
                     dp.send_msg(mod)
+                    # Reinstall table-miss rule to ensure controller can continue receiving packets
+                    match = parser.OFPMatch()
+                    actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                                      ofproto.OFPCML_NO_BUFFER)]
+                    self.add_flow(dp, 0, match, actions)
                 self.mac_to_port.clear()
 
         self._calculate_stp()
@@ -129,6 +135,16 @@ class SconnControllerV9(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(out_port)]
         else:
             self.logger.info("Destination %s unknown on switch %s. Flooding via Spanning Tree.", dst, dpid)
+            
+            # Prevent KeyError: check if dpid is already in datapaths
+            if dpid not in self.datapaths:
+                self.logger.warning("Datapath %s not yet registered, using simple flood.", dpid)
+                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+                data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                          in_port=in_port, actions=actions, data=data)
+                datapath.send_msg(out)
+                return
             
             all_ports = self.datapaths[dpid].ports.keys()
             inter_switch_ports = []
