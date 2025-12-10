@@ -176,7 +176,8 @@ class SconnControllerV9(app_manager.RyuApp):
             self.logger.info("Installing flow on switch %s: in_port=%s, dst=%s -> out_port=%s",
                              dpid, in_port, dst, out_port)
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(datapath, 1, match, actions, idle=10, hard=30)
+            # Shorter timeout for faster failover (idle=3s, hard=10s)
+            self.add_flow(datapath, 1, match, actions, idle=3, hard=10)
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
@@ -202,3 +203,4 @@ class SconnControllerV9(app_manager.RyuApp):
             if datapath.id in self.datapaths:
                 del self.datapaths[datapath.id]
                 self.logger.warning("Datapath %d unregistered", datapath.id)
+
