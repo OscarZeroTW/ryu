@@ -49,7 +49,8 @@ class SconnControllerV9(app_manager.RyuApp):
             # Convert DiGraph to undirected Graph for spanning tree calculation
             # (minimum_spanning_tree only works with undirected graphs)
             undirected = self.switch_net.to_undirected()
-            self.stp_net = nx.minimum_spanning_tree(undirected)
+            # Use 'weight' attribute to prefer wired links (weight=1) over WiFi (weight=10)
+            self.stp_net = nx.minimum_spanning_tree(undirected, weight='weight')
             self.logger.info("Spanning Tree Links (used for flooding): %s", sorted(self.stp_net.edges()))
 
     @set_ev_cls([event.EventSwitchEnter, event.EventLinkAdd, event.EventLinkDelete])
@@ -60,17 +61,19 @@ class SconnControllerV9(app_manager.RyuApp):
             self.logger.info("Switch %s entered.", switch.dp.id)
             
             # Manually add the wireless mesh link once both APs are present
+            # Use higher weight (10) for WiFi link so MST prefers wired links (weight=1)
             if not self.manual_link_added and 2 in self.switch_net and 3 in self.switch_net:
-                self.switch_net.add_edge(2, 3, port=6)
-                self.switch_net.add_edge(3, 2, port=6)
+                self.switch_net.add_edge(2, 3, port=6, weight=10)
+                self.switch_net.add_edge(3, 2, port=6, weight=10)
                 self.manual_link_added = True
-                self.logger.info("Manually added wireless link between 2 and 3.")
+                self.logger.info("Manually added wireless link between 2 and 3 (weight=10).")
 
         elif isinstance(ev, event.EventLinkAdd):
             link = ev.link
-            self.switch_net.add_edge(link.src.dpid, link.dst.dpid, port=link.src.port_no)
-            self.switch_net.add_edge(link.dst.dpid, link.src.dpid, port=link.dst.port_no)
-            self.logger.info("Link added: %s <--> %s", link.src.dpid, link.dst.dpid)
+            # Use weight=1 for wired links (lower than WiFi's weight=10)
+            self.switch_net.add_edge(link.src.dpid, link.dst.dpid, port=link.src.port_no, weight=1)
+            self.switch_net.add_edge(link.dst.dpid, link.src.dpid, port=link.dst.port_no, weight=1)
+            self.logger.info("Link added: %s <--> %s (weight=1)", link.src.dpid, link.dst.dpid)
 
         elif isinstance(ev, event.EventLinkDelete):
             link = ev.link
